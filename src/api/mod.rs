@@ -107,3 +107,11 @@ pub struct ServerSideEncryption {
     pub algorithm: Option<String>,
     pub mode: Option<String>,
 }
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiError {
+    pub code: String,
+    pub message: String,
+    pub status: u16,
+}

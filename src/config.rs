@@ -98,12 +98,17 @@ impl Config {
     }
 
     pub fn authorise(&mut self, key_id: &str, key: &str) -> anyhow::Result<()> {
-        let authorise_url = "https://api.backblazeb2.com/b2api/v3/b2_authorize_account";
+        const AUTHORISE_URL: &str = "https://api.backblazeb2.com/b2api/v3/b2_authorize_account";
 
         let client = reqwest::Client::new()
-            .get(authorise_url)
-            .header("Authorization", get_auth(&self.key_id, &self.key))
+            .get(AUTHORISE_URL)
+            .header("Authorization", get_auth(key_id, key))
             .send()?;
+
+        if client.status() != 200 {
+            let error: api::ApiError = client.json()?;
+            bail!("{} - {}", error.code, error.message);
+        }
 
         let json: api::AuthResponse = client.json()?;
 
@@ -133,6 +138,13 @@ impl Config {
     pub fn get(&mut self, api_name: &str) -> anyhow::Result<reqwest::RequestBuilder> {
         Ok(reqwest::Client::new()
             .get(self.api_url(api_name)?)
+            .header("Authorization", &self.auth_token))
+    }
+
+    /// Get a [`RequestBuilder`] for POST with the "Authorization" header set
+    pub fn post(&mut self, api_name: &str) -> anyhow::Result<reqwest::RequestBuilder> {
+        Ok(reqwest::Client::new()
+            .post(self.api_url(api_name)?)
             .header("Authorization", &self.auth_token))
     }
 

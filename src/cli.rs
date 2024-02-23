@@ -35,7 +35,17 @@ pub enum Command {
         #[arg(value_name = "file")]
         file: PathBuf,
     },
-    // TODO: Cat {},
+    Cat {
+        /// Force the file to be printed even if it is not text
+        #[arg(short, long)]
+        force: bool,
+        /// The bucket from which to download the file
+        #[arg(value_name = "bucket")]
+        bucket: String,
+        /// The path from which to download the file
+        #[arg(value_name = "file")]
+        file: PathBuf,
+    },
     // TODO: GetAccountInfo {},
     // TODO: GetBucket {},
     // TODO: FileInfo {},
@@ -60,6 +70,10 @@ pub enum Command {
     /// Upload a file to b2, if `dest` is not specified, then it will take the name of the file
     /// that is uploaded.
     Upload {
+        /// Upload the file using the "parts" api
+        /// Note: this is automatically enabled if the file that is being uploaded is more than 1GiB
+        #[arg(short, long)]
+        parts: bool,
         /// Manually override the Content Type of the file rather than trying to guess from the
         /// file extension
         #[arg(short, long, value_name = "content-type")]

@@ -1,8 +1,9 @@
 use std::{
     fs,
     hash::Hasher,
-    io::{Seek, SeekFrom, Write},
+    io::{IsTerminal, Seek, SeekFrom, Write},
     ops::Deref,
+    path::Path,
 };
 
 use clap::Parser;
@@ -100,6 +101,7 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Command::Upload {
+            parts,
             file,
             bucket,
             dest,
@@ -133,48 +135,30 @@ fn main() -> anyhow::Result<()> {
 
             let bucket_id = bucket_id.to_string();
 
-            let res: serde_json::Value = cfg
-                .get("b2_get_upload_url")?
-                .query(&[("bucketId", bucket_id)])
-                .send()?
-                .json()?;
+            let len = fs::metadata(&file)?.len();
 
-            let upload_url = res["uploadUrl"].as_str().unwrap();
-            let auth = res["authorizationToken"].as_str().unwrap();
+            let file = if parts || len >= 1024 * 1024 * 1024 {
+                // >= 1 GiB
+                println!("Uploading as parts");
+                upload_file_parts(
+                    &mut cfg,
+                    &bucket_id,
+                    &file,
+                    len,
+                    &dest,
+                    content_type.as_deref(),
+                )?
+            } else {
+                upload_file(
+                    &mut cfg,
+                    &bucket_id,
+                    &file,
+                    len,
+                    &dest,
+                    content_type.as_deref(),
+                )?
+            };
 
-            let mut file = fs::File::open(file)?;
-            let len = file.metadata()?.len();
-
-            let mut sha = Sha1HasherWriterWrapper(Sha1Hasher::default());
-
-            std::io::copy(&mut file, &mut sha)?;
-
-            file.seek(SeekFrom::Start(0))?;
-
-            let hash = HasherContext::finish(&mut sha.0);
-
-            let file = progress::ReaderProgress::new(file, len as usize);
-
-            let file: File = reqwest::Client::new()
-                .post(upload_url)
-                .header("Authorization", auth)
-                .header("X-Bz-File-Name", urlencoding::encode(&dest).to_string())
-                .header(
-                    "Content-Type",
-                    content_type.unwrap_or_else(|| {
-                        mime_guess::from_path(dest)
-                            .first_raw()
-                            .unwrap_or("text/plain")
-                            .into()
-                    }),
-                )
-                .header("Content-Length", len)
-                .header("X-Bz-Content-Sha1", format!("{:02x}", hash))
-                .body(reqwest::Body::new(file))
-                .send()?
-                .json()?;
-
-            finalize_progress_bar();
             println!(
                 "{}",
                 format!(
@@ -221,7 +205,162 @@ fn main() -> anyhow::Result<()> {
                 format!("Downloaded {} to {}!", humanize_bytes_decimal!(n), output).green()
             );
         }
+        Command::Cat {
+            force,
+            bucket,
+            file,
+        } => {
+            cfg.confirm_auth()?;
+            let url = format!("{}/file/{}/{}", &cfg.download_url, bucket, file.display());
+            let mut res = reqwest::Client::new()
+                .get(&url)
+                .header("Authorization", &cfg.auth_token)
+                .send()?;
+
+            let mut s: Vec<u8> = Vec::with_capacity(res.content_length().unwrap_or(0) as usize);
+            res.copy_to(&mut s)?;
+
+            match String::from_utf8(s) {
+                Ok(s) => {
+                    println!("{}", s);
+                }
+                Err(e) => {
+                    let mut stdout = std::io::stdout();
+                    let mut f = force || !stdout.is_terminal();
+                    if !f {
+                        eprint!("This file is not in a plaintext format. Are you sure you want to print? (y/N) ");
+                        std::io::stderr().flush()?;
+                        let mut s = String::with_capacity(1);
+                        std::io::stdin().read_line(&mut s)?;
+                        let s = s.trim().to_lowercase();
+                        if s == "y" {
+                            f = true;
+                        }
+                    }
+
+                    if f {
+                        stdout.write_all(e.as_bytes())?;
+                    } else {
+                        eprintln!("Exiting.");
+                    }
+                }
+            }
+        }
     };
     cfg.save()?;
     Ok(())
+}
+
+fn upload_file(
+    cfg: &mut Config,
+    bucket_id: &str,
+    file: &Path,
+    len: u64,
+    dest: &str,
+    content_type: Option<&str>,
+) -> anyhow::Result<File> {
+    let res: serde_json::Value = cfg
+        .get("b2_get_upload_url")?
+        .query(&[("bucketId", bucket_id)])
+        .send()?
+        .json()?;
+
+    let upload_url = res["uploadUrl"].as_str().unwrap();
+    let auth = res["authorizationToken"].as_str().unwrap();
+
+    let mut sha = Sha1HasherWriterWrapper(Sha1Hasher::default());
+
+    let mut file = fs::File::open(file)?;
+
+    std::io::copy(&mut file, &mut sha)?;
+
+    file.seek(SeekFrom::Start(0))?;
+
+    let hash = HasherContext::finish(&mut sha.0);
+
+    let file = progress::ReaderProgress::new(file, len as usize);
+
+    let out: File = reqwest::Client::new()
+        .post(upload_url)
+        .header("Authorization", auth)
+        .header("X-Bz-File-Name", urlencoding::encode(&dest).to_string())
+        .header(
+            "Content-Type",
+            content_type.unwrap_or_else(|| {
+                mime_guess::from_path(dest)
+                    .first_raw()
+                    .unwrap_or("text/plain")
+                    .into()
+            }),
+        )
+        .header("Content-Length", len)
+        .header("X-Bz-Content-Sha1", format!("{:02x}", hash))
+        .body(reqwest::Body::new(file))
+        .send()?
+        .json()?;
+
+    finalize_progress_bar();
+
+    Ok(out)
+}
+
+fn upload_file_parts(
+    cfg: &mut Config,
+    bucket_id: &str,
+    file: &Path,
+    len: u64,
+    dest: &str,
+    content_type: Option<&str>,
+) -> anyhow::Result<File> {
+    let res = cfg.post("b2_start_large_file")?
+        .json(&serde_json::json!({
+            "bucketId": bucket_id,
+            "fileName": dest,
+            "contentType": content_type.unwrap_or_else(|| {
+                mime_guess::from_path(dest)
+                    .first_raw()
+                    .unwrap_or("text/plain")
+                    .into()
+            }),
+        }))
+        .send()?;
+
+    let res: serde_json::Value = cfg
+        .get("b2_get_upload_parts_url")?
+        .query(&[("bucketId", bucket_id)])
+        .send()?
+        .json()?;
+
+    let upload_url = res["uploadUrl"].as_str().unwrap();
+    let auth = res["authorizationToken"].as_str().unwrap();
+
+    let mut sha = Sha1HasherWriterWrapper(Sha1Hasher::default());
+
+    let mut file = fs::File::open(file)?;
+
+    std::io::copy(&mut file, &mut sha)?;
+
+    file.seek(SeekFrom::Start(0))?;
+
+    let hash = HasherContext::finish(&mut sha.0);
+
+    let file = progress::ReaderProgress::new(file, len as usize);
+
+    let out: File = reqwest::Client::new()
+        .post(upload_url)
+        .header("Authorization", auth)
+        .header("X-Bz-File-Name", urlencoding::encode(&dest).to_string())
+        .header(
+            "Content-Type",
+            ,
+        )
+        .header("Content-Length", len)
+        .header("X-Bz-Content-Sha1", format!("{:02x}", hash))
+        .body(reqwest::Body::new(file))
+        .send()?
+        .json()?;
+
+    finalize_progress_bar();
+
+    Ok(out)
 }
