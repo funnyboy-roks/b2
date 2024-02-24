@@ -1,5 +1,8 @@
 use progress_bar as bar;
-use std::io::{Read, Write};
+use std::{
+    io::{Read, Write},
+    ops::{Deref, DerefMut},
+};
 
 pub struct ReaderProgress<R> {
     inner: R,
@@ -7,9 +10,9 @@ pub struct ReaderProgress<R> {
 }
 
 impl<R> ReaderProgress<R> {
-    pub fn new(r: R, len: usize) -> Self {
+    pub fn new(r: R, len: usize, label: &str) -> Self {
         bar::init_progress_bar_with_eta(len);
-        bar::set_progress_bar_action("Uploading", bar::Color::Green, bar::Style::Bold);
+        bar::set_progress_bar_action(&label, bar::Color::Green, bar::Style::Bold);
         Self { inner: r, curr: 0 }
     }
 }
@@ -27,6 +30,20 @@ where
             }
             Err(e) => Err(e),
         }
+    }
+}
+
+impl<R> Deref for ReaderProgress<R> {
+    type Target = R;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl<R> DerefMut for ReaderProgress<R> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
     }
 }
 

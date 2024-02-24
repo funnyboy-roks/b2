@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::{self, Bucket};
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct Config {
     pub key_id: String,
@@ -23,20 +23,7 @@ pub struct Config {
     pub account_id: String,
     // Bucket Name : Bucket Id
     pub buckets: HashMap<String, String>,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            key_id: Default::default(),
-            key: Default::default(),
-            api_url: Default::default(),
-            download_url: Default::default(),
-            auth_token: Default::default(),
-            account_id: Default::default(),
-            buckets: Default::default(),
-        }
-    }
+    pub recommended_part_size: u64,
 }
 
 impl Config {
@@ -118,6 +105,7 @@ impl Config {
         self.download_url = json.api_info.storage_api.download_url.clone();
         self.auth_token = json.authorization_token.clone();
         self.account_id = json.account_id.clone();
+        self.recommended_part_size = json.api_info.storage_api.recommended_part_size;
 
         Ok(())
     }

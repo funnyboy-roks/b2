@@ -3,13 +3,15 @@ use std::{
     hash::Hasher,
     io::{IsTerminal, Seek, SeekFrom, Write},
     ops::Deref,
+    os::unix::fs::FileExt,
     path::Path,
 };
 
+use anyhow::bail;
 use clap::Parser;
 use colored::Colorize;
 use humanize_bytes::humanize_bytes_decimal;
-use progress_bar::finalize_progress_bar;
+use progress_bar::{finalize_progress_bar, init_progress_bar_with_eta, set_progress_bar_progress};
 use reqwest::blocking as reqwest;
 use rs_sha1::{HasherContext, Sha1Hasher};
 use serde::Deserialize;
@@ -278,7 +280,7 @@ fn upload_file(
 
     let hash = HasherContext::finish(&mut sha.0);
 
-    let file = progress::ReaderProgress::new(file, len as usize);
+    let file = progress::ReaderProgress::new(file, len as usize, "Uploading");
 
     let out: File = reqwest::Client::new()
         .post(upload_url)
@@ -312,7 +314,8 @@ fn upload_file_parts(
     dest: &str,
     content_type: Option<&str>,
 ) -> anyhow::Result<File> {
-    let res = cfg.post("b2_start_large_file")?
+    let res = cfg
+        .post("b2_start_large_file")?
         .json(&serde_json::json!({
             "bucketId": bucket_id,
             "fileName": dest,
@@ -325,42 +328,96 @@ fn upload_file_parts(
         }))
         .send()?;
 
-    let res: serde_json::Value = cfg
-        .get("b2_get_upload_parts_url")?
-        .query(&[("bucketId", bucket_id)])
-        .send()?
-        .json()?;
+    if res.status() != 200 {
+        let error: api::ApiError = res.json()?;
+        bail!("`b2_start_large_file`: {} - {}", error.code, error.message);
+    }
+
+    let res: serde_json::Value = res.json()?;
+
+    let file_id = res["fileId"].as_str().unwrap();
+
+    // TODO: Parallelise this stuff
+
+    let res = cfg
+        .get("b2_get_upload_part_url")?
+        .query(&[("fileId", file_id)])
+        .send()?;
+
+    // 100_000_000
+    let file = fs::File::open(file)?;
+
+    if res.status() != 200 {
+        let error: api::ApiError = res.json()?;
+        bail!(
+            "`b2_get_upload_part_url`: {} - {}",
+            error.code,
+            error.message
+        );
+    }
+
+    let res: serde_json::Value = res.json()?;
+
+    let mut chunk_size = cfg.recommended_part_size;
+
+    let chunks = len / chunk_size;
+    if chunks == 0 || chunks == 1 && chunks % chunk_size == 0 {
+        chunk_size = std::cmp::max(len / 2 + 100, 5_000_000);
+    }
+    let chunks = len / chunk_size;
+
+    if chunks == 0 {
+        bail!("Not enough data to upload by parts");
+    }
 
     let upload_url = res["uploadUrl"].as_str().unwrap();
     let auth = res["authorizationToken"].as_str().unwrap();
 
-    let mut sha = Sha1HasherWriterWrapper(Sha1Hasher::default());
+    init_progress_bar_with_eta(len as usize);
+    let mut buf = vec![0u8; chunk_size as usize];
+    let mut shas = Vec::with_capacity(chunks as usize);
+    let mut total = 0;
+    for n in 0..=chunks {
+        let num_bytes = file.read_at(&mut buf, chunk_size * n)?;
 
-    let mut file = fs::File::open(file)?;
+        let mut shash = Sha1Hasher::default();
+        shash.write(&buf);
+        let hash = HasherContext::finish(&mut shash);
 
-    std::io::copy(&mut file, &mut sha)?;
+        shas.push(format!("{:02x}", hash));
 
-    file.seek(SeekFrom::Start(0))?;
+        let res = reqwest::Client::new()
+            .post(upload_url)
+            .header("Authorization", auth)
+            .header("X-Bz-Part-Number", n + 1)
+            .header("Content-Length", num_bytes)
+            .header("X-Bz-Content-Sha1", shas.last().unwrap())
+            .body(buf.clone()) // TODO: find out how to remove this clone
+            .send()?;
 
-    let hash = HasherContext::finish(&mut sha.0);
+        if res.status() != 200 {
+            let error: api::ApiError = res.json()?;
+            bail!("upload part: {} - {}", error.code, error.message);
+        }
 
-    let file = progress::ReaderProgress::new(file, len as usize);
-
-    let out: File = reqwest::Client::new()
-        .post(upload_url)
-        .header("Authorization", auth)
-        .header("X-Bz-File-Name", urlencoding::encode(&dest).to_string())
-        .header(
-            "Content-Type",
-            ,
-        )
-        .header("Content-Length", len)
-        .header("X-Bz-Content-Sha1", format!("{:02x}", hash))
-        .body(reqwest::Body::new(file))
-        .send()?
-        .json()?;
+        total += num_bytes;
+        set_progress_bar_progress(total);
+    }
 
     finalize_progress_bar();
 
-    Ok(out)
+    let res = cfg
+        .post("b2_finish_large_file")?
+        .json(&serde_json::json!({
+            "fileId": file_id,
+            "partSha1Array": shas,
+        }))
+        .send()?;
+
+    if res.status() != 200 {
+        let error: api::ApiError = res.json()?;
+        bail!("`b2_finish_large_file`: {} - {}", error.code, error.message);
+    }
+
+    Ok(res.json()?)
 }

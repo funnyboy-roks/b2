@@ -88,7 +88,7 @@ pub struct File {
     pub action: String, // TODO: enum
     pub bucket_id: String,
     pub content_length: u64,
-    pub content_md5: String,
+    pub content_md5: Option<String>,
     pub content_sha1: String,
     pub content_type: String,
     pub file_id: String,
