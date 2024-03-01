@@ -78,6 +78,9 @@ pub enum Command {
         /// file extension
         #[arg(short, long, value_name = "content-type")]
         content_type: Option<String>,
+        /// Upload directories recursively
+        #[arg(short, long)]
+        recursive: bool,
         /// The path to the file to upload
         #[arg(value_name = "file")]
         file: PathBuf,

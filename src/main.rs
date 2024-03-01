@@ -4,7 +4,7 @@ use std::{
     io::{IsTerminal, Seek, SeekFrom, Write},
     ops::Deref,
     os::unix::fs::FileExt,
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use anyhow::bail;
@@ -15,6 +15,7 @@ use progress_bar::{finalize_progress_bar, init_progress_bar_with_eta, set_progre
 use reqwest::blocking as reqwest;
 use rs_sha1::{HasherContext, Sha1Hasher};
 use serde::Deserialize;
+use walkdir::WalkDir;
 
 use api::File;
 use cli::Command;
@@ -69,11 +70,12 @@ fn main() -> anyhow::Result<()> {
                 })
                 .to_string();
 
-            let res: serde_json::Value = cfg
-                .get("b2_list_file_names")?
-                .query(&[("bucketId", &bucket_id)])
-                .send()?
-                .json()?;
+            let res: serde_json::Value = cfg.send_request_de(|cfg| {
+                Ok(cfg
+                    .get("b2_list_file_names")?
+                    .query(&[("bucketId", &bucket_id)])
+                    .send()?)
+            })?;
 
             let files: Vec<File> = Deserialize::deserialize(res["files"].clone())?;
 
@@ -108,68 +110,45 @@ fn main() -> anyhow::Result<()> {
             bucket,
             dest,
             content_type,
+            recursive,
         } => {
             cfg.confirm_auth()?;
 
-            if !file.is_file() {
-                eprintln!(
-                    "{} {}",
-                    file.display().to_string().red(),
-                    "is not a file.".red()
-                );
-            }
+            if file.is_dir() {
+                if !recursive {
+                    bail!("-r not specified, omitting directory {}", file.display());
+                }
 
-            let dest = dest
-                .unwrap_or_else(|| {
-                    file.file_name()
-                        .unwrap()
-                        .to_str()
-                        .expect("Invalid file name")
-                        .into()
-                })
-                .display()
-                .to_string();
-
-            let Some(bucket_id) = cfg.get_bucket_id(&bucket)? else {
-                eprintln!("{}", format!("Bucket `{}` does not exist", bucket).red());
-                std::process::exit(1);
-            };
-
-            let bucket_id = bucket_id.to_string();
-
-            let len = fs::metadata(&file)?.len();
-
-            let file = if parts || len >= 1024 * 1024 * 1024 {
-                // >= 1 GiB
-                println!("Uploading as parts");
-                upload_file_parts(
-                    &mut cfg,
-                    &bucket_id,
-                    &file,
-                    len,
-                    &dest,
-                    content_type.as_deref(),
-                )?
+                for entry in WalkDir::new(file)
+                    .into_iter()
+                    .filter_map(|e| e.ok())
+                    .filter(|d| !d.path().is_dir())
+                {
+                    let pb = if let Some(ref dest) = dest {
+                        dest.components().chain(entry.path().components()).collect()
+                    } else {
+                        entry.path().to_path_buf()
+                    };
+                    println!("{}", pb.display());
+                    upload_file(
+                        &mut cfg,
+                        parts,
+                        entry.path(),
+                        &bucket,
+                        Some(pb),
+                        content_type.as_deref(),
+                    )?;
+                }
             } else {
                 upload_file(
                     &mut cfg,
-                    &bucket_id,
+                    parts,
                     &file,
-                    len,
-                    &dest,
+                    &bucket,
+                    dest,
                     content_type.as_deref(),
-                )?
-            };
-
-            println!(
-                "{}",
-                format!(
-                    "Uploaded {} to {}!",
-                    humanize_bytes_decimal!(len),
-                    file.file_name
-                )
-                .green()
-            );
+                )?;
+            }
         }
         Command::Download {
             output,
@@ -178,10 +157,12 @@ fn main() -> anyhow::Result<()> {
         } => {
             cfg.confirm_auth()?;
             let url = format!("{}/file/{}/{}", &cfg.download_url, bucket, file.display());
-            let mut res = reqwest::Client::new()
-                .get(&url)
-                .header("Authorization", &cfg.auth_token)
-                .send()?;
+            let mut res = cfg.send_request_res(|cfg| {
+                Ok(reqwest::Client::new()
+                    .get(&url)
+                    .header("Authorization", &cfg.auth_token)
+                    .send()?)
+            })?;
 
             let output = output
                 .unwrap_or_else(|| {
@@ -255,17 +236,74 @@ fn main() -> anyhow::Result<()> {
 
 fn upload_file(
     cfg: &mut Config,
+    parts: bool,
+    file: &Path,
+    bucket: &str,
+    dest: Option<PathBuf>,
+    content_type: Option<&str>,
+) -> anyhow::Result<()> {
+    if !file.is_file() {
+        eprintln!(
+            "{} {}",
+            file.display().to_string().red(),
+            "is not a file.".red()
+        );
+    }
+
+    let dest = dest.map(|p| p.display().to_string()).unwrap_or_else(|| {
+        let a: PathBuf = file
+            .file_name()
+            .unwrap()
+            .to_str()
+            .expect("Invalid file name")
+            .into();
+        a.display().to_string()
+    });
+
+    let Some(bucket_id) = cfg.get_bucket_id(&bucket)? else {
+        eprintln!("{}", format!("Bucket `{}` does not exist", bucket).red());
+        std::process::exit(1);
+    };
+
+    let bucket_id = bucket_id.to_string();
+
+    let len = fs::metadata(&file)?.len();
+
+    let file = if parts || len >= 1024 * 1024 * 1024 {
+        // >= 1 GiB
+        println!("Uploading as parts");
+        upload_file_parts(cfg, &bucket_id, file, len, &dest, content_type.as_deref())?
+    } else {
+        upload_file_non_parts(cfg, &bucket_id, file, len, &dest, content_type.as_deref())?
+    };
+
+    println!(
+        "{}",
+        format!(
+            "Uploaded {} to {}!",
+            humanize_bytes_decimal!(len),
+            file.file_name
+        )
+        .green()
+    );
+
+    Ok(())
+}
+
+fn upload_file_non_parts(
+    cfg: &mut Config,
     bucket_id: &str,
     file: &Path,
     len: u64,
     dest: &str,
     content_type: Option<&str>,
 ) -> anyhow::Result<File> {
-    let res: serde_json::Value = cfg
-        .get("b2_get_upload_url")?
-        .query(&[("bucketId", bucket_id)])
-        .send()?
-        .json()?;
+    let res: serde_json::Value = cfg.send_request_de(|cfg| {
+        Ok(cfg
+            .get("b2_get_upload_url")?
+            .query(&[("bucketId", bucket_id)])
+            .send()?)
+    })?;
 
     let upload_url = res["uploadUrl"].as_str().unwrap();
     let auth = res["authorizationToken"].as_str().unwrap();
@@ -282,6 +320,7 @@ fn upload_file(
 
     let file = progress::ReaderProgress::new(file, len as usize, "Uploading");
 
+    // TODO: make this work with `cfg.send_request`
     let out: File = reqwest::Client::new()
         .post(upload_url)
         .header("Authorization", auth)
@@ -314,54 +353,40 @@ fn upload_file_parts(
     dest: &str,
     content_type: Option<&str>,
 ) -> anyhow::Result<File> {
-    let res = cfg
-        .post("b2_start_large_file")?
-        .json(&serde_json::json!({
-            "bucketId": bucket_id,
-            "fileName": dest,
-            "contentType": content_type.unwrap_or_else(|| {
-                mime_guess::from_path(dest)
-                    .first_raw()
-                    .unwrap_or("text/plain")
-                    .into()
-            }),
-        }))
-        .send()?;
-
-    if res.status() != 200 {
-        let error: api::ApiError = res.json()?;
-        bail!("`b2_start_large_file`: {} - {}", error.code, error.message);
-    }
-
-    let res: serde_json::Value = res.json()?;
+    let res: serde_json::Value = cfg.send_request_de(|cfg| {
+        Ok(cfg
+            .post("b2_start_large_file")?
+            .json(&serde_json::json!({
+                "bucketId": bucket_id,
+                "fileName": dest,
+                "contentType": content_type.unwrap_or_else(|| {
+                    mime_guess::from_path(dest)
+                        .first_raw()
+                        .unwrap_or("text/plain")
+                        .into()
+                }),
+            }))
+            .send()?)
+    })?;
 
     let file_id = res["fileId"].as_str().unwrap();
 
     // TODO: Parallelise this stuff
 
-    let res = cfg
-        .get("b2_get_upload_part_url")?
-        .query(&[("fileId", file_id)])
-        .send()?;
+    let res: serde_json::Value = cfg.send_request_de(|cfg| {
+        Ok(cfg
+            .get("b2_get_upload_part_url")?
+            .query(&[("fileId", file_id)])
+            .send()?)
+    })?;
 
-    // 100_000_000
     let file = fs::File::open(file)?;
-
-    if res.status() != 200 {
-        let error: api::ApiError = res.json()?;
-        bail!(
-            "`b2_get_upload_part_url`: {} - {}",
-            error.code,
-            error.message
-        );
-    }
-
-    let res: serde_json::Value = res.json()?;
 
     let mut chunk_size = cfg.recommended_part_size;
 
     let chunks = len / chunk_size;
     if chunks == 0 || chunks == 1 && chunks % chunk_size == 0 {
+        // split it into two chunks or chunks of 5MB if that's bigger (because 5MB is the minimum)
         chunk_size = std::cmp::max(len / 2 + 100, 5_000_000);
     }
     let chunks = len / chunk_size;
@@ -386,19 +411,16 @@ fn upload_file_parts(
 
         shas.push(format!("{:02x}", hash));
 
-        let res = reqwest::Client::new()
-            .post(upload_url)
-            .header("Authorization", auth)
-            .header("X-Bz-Part-Number", n + 1)
-            .header("Content-Length", num_bytes)
-            .header("X-Bz-Content-Sha1", shas.last().unwrap())
-            .body(buf.clone()) // TODO: find out how to remove this clone
-            .send()?;
-
-        if res.status() != 200 {
-            let error: api::ApiError = res.json()?;
-            bail!("upload part: {} - {}", error.code, error.message);
-        }
+        let _: serde_json::Value = cfg.send_request_de(|_| {
+            Ok(reqwest::Client::new()
+                .post(upload_url)
+                .header("Authorization", auth)
+                .header("X-Bz-Part-Number", n + 1)
+                .header("Content-Length", num_bytes)
+                .header("X-Bz-Content-Sha1", shas.last().unwrap())
+                .body(buf.clone()) // TODO: find out how to remove this clone
+                .send()?)
+        })?;
 
         total += num_bytes;
         set_progress_bar_progress(total);
@@ -406,18 +428,13 @@ fn upload_file_parts(
 
     finalize_progress_bar();
 
-    let res = cfg
-        .post("b2_finish_large_file")?
-        .json(&serde_json::json!({
-            "fileId": file_id,
-            "partSha1Array": shas,
-        }))
-        .send()?;
-
-    if res.status() != 200 {
-        let error: api::ApiError = res.json()?;
-        bail!("`b2_finish_large_file`: {} - {}", error.code, error.message);
-    }
-
-    Ok(res.json()?)
+    Ok(cfg.send_request_de(|cfg| {
+        Ok(cfg
+            .post("b2_finish_large_file")?
+            .json(&serde_json::json!({
+                "fileId": file_id,
+                "partSha1Array": shas,
+            }))
+            .send()?)
+    })?)
 }

@@ -8,9 +8,11 @@ use std::{
 use anyhow::bail;
 use colored::Colorize;
 use reqwest::blocking as reqwest;
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
-use crate::api::{self, Bucket};
+use crate::api;
+
+const AUTHORISE_URL: &str = "https://api.backblazeb2.com/b2api/v3/b2_authorize_account";
 
 #[derive(Debug, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -85,8 +87,6 @@ impl Config {
     }
 
     pub fn authorise(&mut self, key_id: &str, key: &str) -> anyhow::Result<()> {
-        const AUTHORISE_URL: &str = "https://api.backblazeb2.com/b2api/v3/b2_authorize_account";
-
         let client = reqwest::Client::new()
             .get(AUTHORISE_URL)
             .header("Authorization", get_auth(key_id, key))
@@ -110,8 +110,68 @@ impl Config {
         Ok(())
     }
 
+    pub fn send_request_de<T, F>(&mut self, req: F) -> anyhow::Result<T>
+    where
+        T: DeserializeOwned,
+        F: FnMut(&mut Config) -> anyhow::Result<reqwest::Response>,
+    {
+        Ok(self.send_request_res(req)?.json()?)
+    }
+
+    pub fn send_request_res<F>(&mut self, mut req: F) -> anyhow::Result<reqwest::Response>
+    where
+        F: FnMut(&mut Config) -> anyhow::Result<reqwest::Response>,
+    {
+        let mut loops = 5;
+        loop {
+            let res = req(self)?;
+
+            if loops == 0 {
+                bail!("Unable to authorise with Backblaze.");
+            }
+
+            if res.status() == 200 {
+                break Ok(res);
+            } else {
+                let url = res.url().clone();
+                let error: api::ApiError = res.json()?;
+                if error.code == "expired_auth_token" {
+                    self.reauth()?;
+                } else {
+                    bail!("`{}`: {} - {}", url, error.code, error.message);
+                }
+            }
+
+            loops -= 1;
+        }
+    }
+
+    pub fn reauth(&mut self) -> anyhow::Result<()> {
+        self.confirm_auth()?;
+
+        let client = reqwest::Client::new()
+            .get(AUTHORISE_URL)
+            .header("Authorization", get_auth(&self.key_id, &self.key))
+            .send()?;
+
+        if client.status() != 200 {
+            let error: api::ApiError = client.json()?;
+            bail!("{} - {}", error.code, error.message);
+        }
+
+        let json: api::AuthResponse = client.json()?;
+
+        self.api_url = json.api_info.storage_api.api_url.clone();
+        self.download_url = json.api_info.storage_api.download_url.clone();
+        self.auth_token = json.authorization_token.clone();
+        self.account_id = json.account_id.clone();
+        self.recommended_part_size = json.api_info.storage_api.recommended_part_size;
+
+        Ok(())
+    }
+
     pub fn confirm_auth(&mut self) -> anyhow::Result<()> {
-        if self.key.len() * self.key_id.len() == 0 {
+        if self.key.len() == 0 || self.key_id.len() == 0 {
             self.auth_from_stdin()?;
         }
         Ok(())
@@ -144,7 +204,7 @@ impl Config {
             .send()?;
 
         let value = res.json::<serde_json::Value>()?;
-        let buckets: Vec<Bucket> = Deserialize::deserialize(value["buckets"].clone())?;
+        let buckets: Vec<api::Bucket> = Deserialize::deserialize(value["buckets"].clone())?;
 
         for bucket in buckets {
             self.buckets.insert(bucket.bucket_name, bucket.bucket_id);
