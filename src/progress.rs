@@ -12,7 +12,7 @@ pub struct ReaderProgress<R> {
 impl<R> ReaderProgress<R> {
     pub fn new(r: R, len: usize, label: &str) -> Self {
         bar::init_progress_bar_with_eta(len);
-        bar::set_progress_bar_action(&label, bar::Color::Green, bar::Style::Bold);
+        bar::set_progress_bar_action(label, bar::Color::Green, bar::Style::Bold);
         Self { inner: r, curr: 0 }
     }
 }

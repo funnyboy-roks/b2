@@ -171,7 +171,7 @@ impl Config {
     }
 
     pub fn confirm_auth(&mut self) -> anyhow::Result<()> {
-        if self.key.len() == 0 || self.key_id.len() == 0 {
+        if self.key.is_empty() || self.key_id.is_empty() {
             self.auth_from_stdin()?;
         }
         Ok(())

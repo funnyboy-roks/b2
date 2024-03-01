@@ -90,7 +90,7 @@ fn main() -> anyhow::Result<()> {
                     println!(
                         "{:>6}   {:>13}   {}",
                         humanize_bytes_decimal!(file.content_length)
-                            .strip_suffix("B")
+                            .strip_suffix('B')
                             .unwrap()
                             .replace(' ', "")
                             .green(),
@@ -196,7 +196,7 @@ fn main() -> anyhow::Result<()> {
             cfg.confirm_auth()?;
             let url = format!("{}/file/{}/{}", &cfg.download_url, bucket, file.display());
             let mut res = reqwest::Client::new()
-                .get(&url)
+                .get(url)
                 .header("Authorization", &cfg.auth_token)
                 .send()?;
 
@@ -260,21 +260,21 @@ fn upload_file(
         a.display().to_string()
     });
 
-    let Some(bucket_id) = cfg.get_bucket_id(&bucket)? else {
+    let Some(bucket_id) = cfg.get_bucket_id(bucket)? else {
         eprintln!("{}", format!("Bucket `{}` does not exist", bucket).red());
         std::process::exit(1);
     };
 
     let bucket_id = bucket_id.to_string();
 
-    let len = fs::metadata(&file)?.len();
+    let len = fs::metadata(file)?.len();
 
     let file = if parts || len >= 1024 * 1024 * 1024 {
         // >= 1 GiB
         println!("Uploading as parts");
-        upload_file_parts(cfg, &bucket_id, file, len, &dest, content_type.as_deref())?
+        upload_file_parts(cfg, &bucket_id, file, len, &dest, content_type)?
     } else {
-        upload_file_non_parts(cfg, &bucket_id, file, len, &dest, content_type.as_deref())?
+        upload_file_non_parts(cfg, &bucket_id, file, len, &dest, content_type)?
     };
 
     println!(
@@ -324,14 +324,13 @@ fn upload_file_non_parts(
     let out: File = reqwest::Client::new()
         .post(upload_url)
         .header("Authorization", auth)
-        .header("X-Bz-File-Name", urlencoding::encode(&dest).to_string())
+        .header("X-Bz-File-Name", urlencoding::encode(dest).to_string())
         .header(
             "Content-Type",
             content_type.unwrap_or_else(|| {
                 mime_guess::from_path(dest)
                     .first_raw()
                     .unwrap_or("text/plain")
-                    .into()
             }),
         )
         .header("Content-Length", len)
@@ -363,7 +362,6 @@ fn upload_file_parts(
                     mime_guess::from_path(dest)
                         .first_raw()
                         .unwrap_or("text/plain")
-                        .into()
                 }),
             }))
             .send()?)
@@ -428,7 +426,7 @@ fn upload_file_parts(
 
     finalize_progress_bar();
 
-    Ok(cfg.send_request_de(|cfg| {
+    cfg.send_request_de(|cfg| {
         Ok(cfg
             .post("b2_finish_large_file")?
             .json(&serde_json::json!({
@@ -436,5 +434,5 @@ fn upload_file_parts(
                 "partSha1Array": shas,
             }))
             .send()?)
-    })?)
+    })
 }
