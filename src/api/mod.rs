@@ -83,9 +83,18 @@ pub struct GenericConfig {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub enum Action {
+    Start,
+    Upload,
+    Hide,
+    Folder,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct File {
     pub account_id: String,
-    pub action: String, // TODO: enum
+    pub action: Action,
     pub bucket_id: String,
     pub content_length: u64,
     pub content_md5: Option<String>,

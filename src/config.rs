@@ -206,8 +206,11 @@ impl Config {
         let value = res.json::<serde_json::Value>()?;
         let buckets: Vec<api::Bucket> = Deserialize::deserialize(value["buckets"].clone())?;
 
+        self.buckets.clear();
+
         for bucket in buckets {
-            self.buckets.insert(bucket.bucket_name, bucket.bucket_id);
+            self.buckets
+                .insert(bucket.bucket_name.to_lowercase(), bucket.bucket_id);
         }
 
         Ok(())
@@ -217,7 +220,7 @@ impl Config {
     /// the name
     /// Returns None if the bucket does not exist
     pub fn get_bucket_id<'a>(&'a mut self, name: &str) -> anyhow::Result<Option<&'a str>> {
-        if self.buckets.contains_key(name) {
+        if self.buckets.contains_key(&name.to_lowercase()) {
             return Ok(Some(&self.buckets[name]));
         }
 

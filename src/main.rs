@@ -24,6 +24,7 @@ use config::Config;
 mod api;
 mod cli;
 mod config;
+mod files;
 mod progress;
 
 /// Does what it says on the can: wraps [`Sha1Hasher`] and gives it a [`Write`] implementation
@@ -61,7 +62,12 @@ fn main() -> anyhow::Result<()> {
                 println!("{}", bucket);
             }
         }
-        Command::Ls { bucket, long } => {
+        Command::Ls {
+            bucket,
+            long,
+            all,
+            search: prefix,
+        } => {
             let bucket_id = cfg
                 .get_bucket_id(&bucket)?
                 .unwrap_or_else(|| {
@@ -70,39 +76,119 @@ fn main() -> anyhow::Result<()> {
                 })
                 .to_string();
 
+            let mut query = Vec::with_capacity(2);
+            query.push(("bucketId", bucket_id));
+
+            if let Some(prefix) = prefix {
+                query.push(("prefix", prefix));
+            }
+
             let res: serde_json::Value = cfg.send_request_de(|cfg| {
-                Ok(cfg
-                    .get("b2_list_file_names")?
-                    .query(&[("bucketId", &bucket_id)])
-                    .send()?)
+                Ok(cfg.get("b2_list_file_names")?.query(&query).send()?)
             })?;
 
             let files: Vec<File> = Deserialize::deserialize(res["files"].clone())?;
 
-            if long {
-                println!(
-                    "  {}   {}   {}",
-                    "Size".underline(),
-                    "Date Uploaded".underline(),
-                    "Name".underline()
-                );
-                for file in files {
+            if all {
+                if long {
+                    // TODO: make this less shit
                     println!(
-                        "{:>6}   {:>13}   {}",
-                        humanize_bytes_decimal!(file.content_length)
-                            .strip_suffix('B')
-                            .unwrap()
-                            .replace(' ', "")
-                            .green(),
-                        file.upload_timestamp.format("%e %h %Y").to_string().blue(),
-                        file.file_name.yellow(),
+                        "  {}   {}   {}",
+                        "Size".underline(),
+                        "Date Uploaded".underline(),
+                        "Name".underline()
                     );
+                    for file in files {
+                        print!(
+                            "{:>6}   {:>13}   ",
+                            humanize_bytes_decimal!(file.content_length)
+                                .strip_suffix('B')
+                                .unwrap()
+                                .replace(' ', "")
+                                .green(),
+                            file.upload_timestamp.format("%e %h %Y").to_string().blue(),
+                        );
+                        if file.file_name.contains('/') {
+                            let parts: Vec<_> = file.file_name.split('/').collect();
+                            for part in &parts[..parts.len() - 1] {
+                                print!("{}/", part.blue());
+                            }
+                            print!("{}", parts.last().unwrap().yellow());
+                        } else {
+                            print!("{}", file.file_name.yellow());
+                        }
+                        println!();
+                    }
+                } else {
+                    for file in files {
+                        println!("{}", file.file_name);
+                    }
                 }
             } else {
-                for file in files {
-                    println!("{}", file.file_name);
+                if long {
+                    println!(
+                        "  {}   {}   {}",
+                        "Size".underline(),
+                        "Date Uploaded".underline(),
+                        "Name".underline()
+                    );
+                }
+                match files::files_to_tree(files) {
+                    files::FileTree::Directory { .. } => unreachable!(),
+                    files::FileTree::File { .. } => unreachable!(),
+                    files::FileTree::Root { children } => {
+                        for (_, child) in children {
+                            match child {
+                                files::FileTree::Directory { name, .. } => {
+                                    println!("                         {}/", name.blue());
+                                }
+                                files::FileTree::File { file, .. } => {
+                                    println!(
+                                        "{:>6}   {:>13}   {}",
+                                        humanize_bytes_decimal!(file.content_length)
+                                            .strip_suffix('B')
+                                            .unwrap()
+                                            .replace(' ', "")
+                                            .green(),
+                                        file.upload_timestamp.format("%e %h %Y").to_string().blue(),
+                                        file.file_name.yellow(),
+                                    );
+                                }
+                                files::FileTree::Root { .. } => unreachable!(),
+                            }
+                        }
+                    }
                 }
             }
+        }
+        Command::Tree {
+            bucket,
+            long,
+            search: prefix,
+        } => {
+            let bucket_id = cfg
+                .get_bucket_id(&bucket)?
+                .unwrap_or_else(|| {
+                    eprintln!("Bucket `{}` does not exist", bucket);
+                    std::process::exit(1);
+                })
+                .to_string();
+
+            let mut query = Vec::with_capacity(2);
+            query.push(("bucketId", bucket_id));
+
+            if let Some(prefix) = prefix {
+                query.push(("prefix", prefix));
+            }
+
+            let res: serde_json::Value = cfg.send_request_de(|cfg| {
+                Ok(cfg.get("b2_list_file_names")?.query(&query).send()?)
+            })?;
+
+            let files: Vec<File> = Deserialize::deserialize(res["files"].clone())?;
+
+            let tree = files::files_to_tree(files);
+            files::print_tree(tree, long);
         }
         Command::Upload {
             parts,
@@ -149,6 +235,20 @@ fn main() -> anyhow::Result<()> {
                     content_type.as_deref(),
                 )?;
             }
+        }
+        Command::Share { bucket, file } => {
+            let file = file.display().to_string();
+
+            if cfg.get_bucket_id(&bucket)?.is_none() {
+                eprintln!(
+                    "{}",
+                    format!("A bucket by the name {} does not exist.", bucket).red()
+                );
+                std::process::exit(1);
+            }
+
+            let url = format!("{}/file/{}/{}", &cfg.download_url, bucket, file);
+            println!("{}", url.green());
         }
         Command::Download {
             output,
@@ -228,6 +328,24 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
             }
+        }
+        Command::CreateBucket { name, visibility } => {
+            let res: serde_json::Value = cfg.send_request_de(|cfg| {
+                Ok(cfg
+                    .post("b2_create_bucket")?
+                    .json(&serde_json::json!({
+                        "accountId": cfg.account_id,
+                        "bucketName": name,
+                        "bucketType": match (visibility.private, visibility.public) {
+                            (true, false) => "allPrivate",
+                            (false, true) => "allPublic",
+                            _ => unreachable!(),
+                        },
+                    }))
+                    .send()?)
+            })?;
+
+            cfg.get_buckets()?;
         }
     };
     cfg.save()?;

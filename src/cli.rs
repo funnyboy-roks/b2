@@ -9,11 +9,35 @@ pub struct Cli {
     pub command: Command,
 }
 
+#[derive(Debug, clap::Args)]
+#[group(required = true, multiple = false)]
+pub struct BucketType {
+    #[clap(long)]
+    pub private: bool,
+    #[clap(long)]
+    pub public: bool,
+}
+
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Authorise your b2 account
     #[command(alias = "authorize")]
     Authorise,
+    /// Get the url to share a file in a public bucket
+    Share {
+        /// The bucket from which to download the file
+        #[arg(value_name = "bucket")]
+        bucket: String,
+        /// The path from which to download the file
+        #[arg(value_name = "file")]
+        file: PathBuf,
+    },
+    CreateBucket {
+        #[arg(value_name = "name")]
+        name: String,
+        #[clap(flatten)]
+        visibility: BucketType,
+    },
     // TODO: CancelAllUnfinishedLargeFiles {},
     // TODO: CancelLargeFile {},
     // TODO: ClearAccount {},
@@ -59,9 +83,30 @@ pub enum Command {
     // TODO: ListUnfinishedLargeFiles {},
     /// Show files in a specific bucket
     Ls {
+        /// List information about the file such as date uploaded and file size
         #[arg(short, long)]
         long: bool,
+        /// List all files, including their full path
+        #[arg(short, long)]
+        all: bool,
+        /// The bucket from which to list the file
+        #[arg(value_name = "bucket")]
         bucket: String,
+        /// The prefix of files to search
+        #[arg(value_name = "search")]
+        search: Option<String>,
+    },
+    /// Show files in a specific bucket as a tree
+    Tree {
+        /// List information about the file such as date uploaded and file size
+        #[arg(short, long)]
+        long: bool,
+        /// The bucket from which to list the file
+        #[arg(value_name = "bucket")]
+        bucket: String,
+        /// The prefix of files to search
+        #[arg(value_name = "search")]
+        search: Option<String>,
     },
     // TODO: Rm {},
     // TODO: GetUrl {},
